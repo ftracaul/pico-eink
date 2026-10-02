@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Envoyer vers l'afficheur e-ink</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  #preview { width: 100%; border: 1px solid #ccc; margin: 1rem 0; image-rendering: pixelated; }
+  button { width: 100%; padding: 0.8rem; font-size: 1rem; margin: 0.3rem 0; border-radius: 8px; border: none; }
+  #pick { background: #eee; }
+  #send { background: #007aff; color: white; }
+  #send:disabled { background: #ccc; }
+  #status { font-size: 0.9rem; color: #444; white-space: pre-line; min-height: 3em; }
+  progress { width: 100%; }
+</style>
+</head>
+<body>
+
+<h1>Envoyer vers l'afficheur e-ink (Bluetooth)</h1>
+
+<input type="file" id="pick" accept="image/*">
+<canvas id="preview" width="280" height="480"></canvas>
+<button id="send" disabled>Envoyer au Pico</button>
+<progress id="progress" value="0" max="1" style="display:none"></progress>
+<div id="status">Choisis une image pour commencer.</div>
+
+<script>
+const TARGET_W = 280;
+const TARGET_H = 480;
+const EXPECTED_LEN = TARGET_W * TARGET_H / 8; // 16800
+
+// Mêmes UUIDs que dans ble_eink.py côté Pico.
+const SERVICE_UUID = "a8c46b95-f81e-4193-8224-354857607bea";
+const DATA_CHAR_UUID = "82c4b493-5654-45f3-ae5c-59767ca701fc";
+const CTRL_CHAR_UUID = "e2ffdd3c-c5f3-4f9c-810b-e3803ed3cc1d";
+
+const CTRL_RESET = 0x01;
+const CTRL_COMMIT = 0x02;
+
+// 20 octets = la charge utile garantie par l'ATT MTU par défaut (23 octets,
+// moins 3 d'en-tête) sans négociation préalable. Des paquets plus gros ont
+// été observés tronqués silencieusement par Bluefy (pas d'erreur, juste une
+// perte de données) — donc on reste prudent plutôt que rapide.
+const CHUNK_SIZE = 20;
+
+const canvas = document.getElementById("preview");
+const ctx = canvas.getContext("2d");
+const pickInput = document.getElementById("pick");
+const sendBtn = document.getElementById("send");
+const statusEl = document.getElementById("status");
+const progressEl = document.getElementById("progress");
+
+let packedBitmap = null; // Uint8Array de 16800 octets, prête à envoyer
+
+function setStatus(msg) {
+  statusEl.textContent = msg;
+}
+
+// --- Redimensionnement (letterbox blanc) + dithering Floyd-Steinberg ---
+function processImage(img) {
+  const ratio = Math.min(TARGET_W / img.width, TARGET_H / img.height);
+  const w = Math.max(1, Math.round(img.width * ratio));
+  const h = Math.max(1, Math.round(img.height * ratio));
+  const ox = Math.floor((TARGET_W - w) / 2);
+  const oy = Math.floor((TARGET_H - h) / 2);
+
+  ctx.fillStyle = "white";
+  ctx.fillRect(0, 0, TARGET_W, TARGET_H);
+  ctx.drawImage(img, ox, oy, w, h);
+
+  const imageData = ctx.getImageData(0, 0, TARGET_W, TARGET_H);
+  const px = imageData.data; // RGBA
+
+  // Niveaux de gris en Float32 pour la diffusion d'erreur.
+  const gray = new Float32Array(TARGET_W * TARGET_H);
+  for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+    gray[j] = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+  }
+
+  // Floyd-Steinberg : seuil 127, diffusion 7/16, 3/16, 5/16, 1/16.
+  for (let y = 0; y < TARGET_H; y++) {
+    for (let x = 0; x < TARGET_W; x++) {
+      const idx = y * TARGET_W + x;
+      const old = gray[idx];
+      const newVal = old < 128 ? 0 : 255;
+      const err = old - newVal;
+      gray[idx] = newVal;
+
+      if (x + 1 < TARGET_W) gray[idx + 1] += err * 7 / 16;
+      if (y + 1 < TARGET_H) {
+        if (x > 0) gray[idx + TARGET_W - 1] += err * 3 / 16;
+        gray[idx + TARGET_W] += err * 5 / 16;
+        if (x + 1 < TARGET_W) gray[idx + TARGET_W + 1] += err * 1 / 16;
+      }
+    }
+  }
+
+  // Ré-affichage du résultat ditheré dans le canvas (contrôle visuel).
+  for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+    px[i] = px[i + 1] = px[i + 2] = gray[j];
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  // Empaquetage en 1 bit/pixel, MSB en tête, 1=blanc/0=noir — même format
+  // que epaper3in7.py et relay_server.py côté Pico.
+  const packed = new Uint8Array(EXPECTED_LEN);
+  for (let y = 0; y < TARGET_H; y++) {
+    for (let bx = 0; bx < TARGET_W / 8; bx++) {
+      let byte = 0;
+      for (let bit = 0; bit < 8; bit++) {
+        const x = bx * 8 + bit;
+        const isWhite = gray[y * TARGET_W + x] >= 128;
+        if (isWhite) byte |= (0x80 >> bit);
+      }
+      packed[y * (TARGET_W / 8) + bx] = byte;
+    }
+  }
+
+  return packed;
+}
+
+pickInput.addEventListener("change", () => {
+  const file = pickInput.files[0];
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => {
+    packedBitmap = processImage(img);
+    sendBtn.disabled = false;
+    setStatus("Image prête (" + packedBitmap.length + " octets). Tu peux l'envoyer.");
+  };
+  img.src = URL.createObjectURL(file);
+});
+
+sendBtn.addEventListener("click", async () => {
+  if (!packedBitmap) return;
+  sendBtn.disabled = true;
+  progressEl.style.display = "block";
+  progressEl.value = 0;
+
+  try {
+    setStatus("Recherche du Pico en Bluetooth...");
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+    });
+
+    setStatus("Connexion...");
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    const dataChar = await service.getCharacteristic(DATA_CHAR_UUID);
+    const ctrlChar = await service.getCharacteristic(CTRL_CHAR_UUID);
+
+    setStatus("Réinitialisation du buffer...");
+    await ctrlChar.writeValueWithResponse(new Uint8Array([CTRL_RESET]));
+
+    const total = packedBitmap.length;
+    for (let offset = 0; offset < total; offset += CHUNK_SIZE) {
+      const chunk = packedBitmap.slice(offset, offset + CHUNK_SIZE);
+      await dataChar.writeValueWithResponse(chunk);
+      progressEl.value = (offset + chunk.length) / total;
+      setStatus("Envoi... " + Math.round(progressEl.value * 100) + "%");
+    }
+
+    setStatus("Validation côté Pico...");
+    await ctrlChar.writeValueWithResponse(new Uint8Array([CTRL_COMMIT]));
+
+    setStatus("Terminé ! L'écran devrait afficher l'image.");
+    device.gatt.disconnect();
+  } catch (err) {
+    setStatus("Erreur : " + err.message);
+  } finally {
+    sendBtn.disabled = false;
+  }
+});
+</script>
+
+</body>
+</html>
